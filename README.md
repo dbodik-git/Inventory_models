@@ -8,11 +8,11 @@ metadata blobs; full model weights are not loaded into RAM.
 
 Examples:
 ```
-  python model_inventory.py "E:\\SD\\checkpoints"
+  python model_inventory.py "C:\\checkpoints"
 ```
 ```
-  python model_inventory.py "E:\\SD\\checkpoints" "E:\\SD\\Lora" --output models.html
+  python model_inventory.py "C:\\checkpoints" "C:\\Lora" --output models.html
 ```
 ```
-  python model_inventory.py "D:\\AI\\Models" --output models.html --json models.json
+  python model_inventory.py "C:\\Models" --output models.html --json models.json
 ```
