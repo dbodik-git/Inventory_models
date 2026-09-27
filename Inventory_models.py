@@ -100,7 +100,7 @@ QUANT_PATTERNS = [
 
 # Bumped whenever ModelInfo's field set changes; guards against loading a
 # cache written by an older/incompatible version of this script.
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 # ggml tensor type enum -> display name (llama.cpp / gguf spec). Unknown
 # values fall back to "GGML_TYPE_<n>" rather than failing.
@@ -148,7 +148,7 @@ class ModelInfo:
 
 def human_bytes(value: int | None) -> str:
     if value is None:
-        return "�"
+        return "—"
     n = float(value)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024.0 or unit == "TB":
@@ -159,7 +159,7 @@ def human_bytes(value: int | None) -> str:
 
 def human_params(value: int | None) -> str:
     if not value:
-        return "�"
+        return "—"
     n = float(value)
     for unit in ("", "K", "M", "B", "T"):
         if abs(n) < 1000.0 or unit == "T":
@@ -368,9 +368,9 @@ def dtype_summary(header: dict[str, Any]) -> tuple[str, int, int, int]:
         params += tensor_numel(entry)
 
     summary = ", ".join(
-        f"{dtype}?{count}" for dtype, count in counts.most_common()
+        f"{dtype}×{count}" for dtype, count in counts.most_common()
     )
-    return summary or "�", tensors, payload, params
+    return summary or "—", tensors, payload, params
 
 
 def selected_metadata(header: dict[str, Any]) -> dict[str, str]:
@@ -1024,7 +1024,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <th data-key="quant">Quantization<span class="arrow"></span></th>
         <th data-key="dtype">Dtype<span class="arrow"></span></th>
         <th data-key="size" class="num">Size<span class="arrow"></span></th>
-        <th data-key="params" class="num">Params<span class="arrow"></span></th>
+        <th data-key="params" class="num">Tensor elements<span class="arrow"></span></th>
         <th data-key="confidence">Confidence<span class="arrow"></span></th>
         <th data-key="path">Path<span class="arrow"></span></th>
       </tr>
@@ -1106,7 +1106,7 @@ function rowHtml(rec, q) {
     ? "<a class='model-link' href='" + rec.link + "' target='_blank' rel='noopener'>" + highlight(rec.name, q) + "</a>"
     : "<span class='no-link'>" + highlight(rec.name, q) + "</span>";
   const dupBadge = (rec.duplicates && rec.duplicates.length)
-    ? " <span class='badge MEDIUM' title='Exact duplicate(s) found'>dup &times;" + rec.duplicates.length + "</span>"
+    ? " <span class='badge MEDIUM' title='Likely duplicate(s): same quick fingerprint'>dup &times;" + rec.duplicates.length + "</span>"
     : "";
   return "<tr>" +
     "<td>" + nameCell + dupBadge + renderDiagCell(rec) + "</td>" +
@@ -1276,7 +1276,7 @@ def main() -> int:
     parser.add_argument(
         "--cache",
         default=".model_inventory_cache.json",
-        help="cache file path; unchanged files (same size+mtime) are read "
+        help="cache file path; unchanged files (same size+mtime_ns) are read "
              "from here instead of being re-inspected (default: %(default)s)",
     )
     parser.add_argument(
@@ -1296,7 +1296,7 @@ def main() -> int:
         roots = [Path(x).expanduser() for x in args.roots]
     else:
         roots = [
-            Path(r"С:\checkpoints"),
+            Path(r"C:\checkpoints"),
         ]
         print("No roots supplied; using default Forge-style roots:")
         for root in roots:
@@ -1316,7 +1316,7 @@ def main() -> int:
 
     infos: list[ModelInfo] = []
     to_inspect: list[tuple[Path, Path]] = []
-    path_stats: dict[str, tuple[int, float]] = {}
+    path_stats: dict[str, tuple[int, int]] = {}
 
     for path, root in files:
         key = str(path.resolve())
@@ -1327,12 +1327,12 @@ def main() -> int:
             print(f"[!] Cannot stat {path}: {exc}")
             continue
 
-        path_stats[key] = (st.st_size, st.st_mtime)
+        path_stats[key] = (st.st_size, st.st_mtime_ns)
         cached = cache_entries.get(key)
         if (
             cached is not None
             and cached.get("size") == st.st_size
-            and cached.get("mtime") == st.st_mtime
+            and cached.get("mtime_ns") == st.st_mtime_ns
         ):
             try:
                 info = ModelInfo(**cached["info"])
@@ -1364,8 +1364,8 @@ def main() -> int:
     if not args.no_cache:
         info_by_full_path = {info.full_path: info for info in infos}
         new_entries = {
-            key: {"size": size, "mtime": mtime, "info": asdict(info_by_full_path[key])}
-            for key, (size, mtime) in path_stats.items()
+            key: {"size": size, "mtime_ns": mtime_ns, "info": asdict(info_by_full_path[key])}
+            for key, (size, mtime_ns) in path_stats.items()
             if key in info_by_full_path
         }
         save_cache(cache_path, new_entries)
@@ -1388,7 +1388,7 @@ def main() -> int:
     print(f"  Files: {len(infos)}")
     print(f"  Total: {human_bytes(total)}")
     if dup_groups:
-        print(f"  Duplicates: {len(dup_groups)} file(s) have at least one exact match elsewhere")
+        print(f"  Likely duplicates: {len(dup_groups)} file(s) share a quick fingerprint with another file")
     print(f"  Report: {output}")
     if args.json_output:
         print(f"  JSON: {args.json_output}")
