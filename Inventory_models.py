@@ -1186,7 +1186,7 @@ function renderRootTabs() {
   const roots = [...new Set(DATA.map(r => r.root).filter(Boolean))].sort((a, b) =>
     a.toLowerCase().localeCompare(b.toLowerCase())
   );
-  const entries = [{ key: "__ALL__", label: "Все папки", count: DATA.length }, ...roots.map(root => ({
+  const entries = [{ key: "__ALL__", label: "All folders", count: DATA.length }, ...roots.map(root => ({
     key: root,
     label: root,
     count: DATA.filter(r => r.root === root).length
