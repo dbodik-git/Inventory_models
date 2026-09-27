@@ -847,9 +847,27 @@ def build_html(
         metadata_shown = {
             k: v for k, v in item.metadata.items() if k in DIAG_METADATA_KEYS
         }
+        item_root = "Unknown root"
+        try:
+            item_path = Path(item.full_path).resolve()
+            matching_roots = []
+            for root in roots:
+                try:
+                    resolved_root = root.resolve()
+                    if item_path.is_relative_to(resolved_root):
+                        matching_roots.append(resolved_root)
+                except OSError:
+                    pass
+            if matching_roots:
+                # If roots overlap, use the most specific (deepest) root.
+                item_root = str(max(matching_roots, key=lambda p: len(p.parts)))
+        except OSError:
+            pass
+
         records.append({
             "name": item.name,
             "ext": item.extension,
+            "root": item_root,
             "role": item.role,
             "family": item.family,
             "confidence": item.family_confidence,
@@ -970,6 +988,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .path-cell { color: var(--muted); font-size: 12.5px; word-break: break-all; }
   footer { color: var(--muted); font-size: 12px; margin-top: 20px; }
   footer code { color: var(--text); }
+  .root-tabs {
+    display: flex; gap: 7px; flex-wrap: wrap; margin: 0 0 14px;
+    padding-bottom: 2px; border-bottom: 1px solid var(--border);
+  }
+  .root-tab {
+    padding: 7px 11px; border: 1px solid transparent; border-radius: 8px 8px 0 0;
+    background: transparent; color: var(--muted); cursor: pointer; font: inherit;
+    max-width: min(420px, 90vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .root-tab:hover { background: var(--row-hover); color: var(--text); }
+  .root-tab.active {
+    color: var(--accent); border-color: var(--border); border-bottom-color: var(--panel);
+    background: var(--panel); margin-bottom: -1px;
+  }
+  .root-tab .tab-count { opacity: .7; margin-left: 5px; font-size: 12px; }
   .empty-state { padding: 30px; text-align: center; color: var(--muted); }
 </style>
 </head>
@@ -1000,6 +1033,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <div class="panel">
+  <div id="rootTabs" class="root-tabs" role="tablist" aria-label="Scanned folders"></div>
   <div class="controls">
     <input id="search" type="text" placeholder="Search name, family, role, quantization, path...">
     <label class="meta">Group by
@@ -1046,7 +1080,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <script>
 const DATA = __DATA_JSON__;
 
-const state = { search: "", sortKey: "size", sortDir: -1, groupBy: "family", dupOnly: false };
+const state = {
+  search: "", sortKey: "size", sortDir: -1, groupBy: "family",
+  dupOnly: false, root: "__ALL__"
+};
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -1063,7 +1100,12 @@ function highlight(text, query) {
   return escaped.replace(re, m => "<mark>" + m + "</mark>");
 }
 
+function matchesRoot(rec) {
+  return state.root === "__ALL__" || rec.root === state.root;
+}
+
 function matches(rec, q) {
+  if (!matchesRoot(rec)) return false;
   if (state.dupOnly && !(rec.duplicates && rec.duplicates.length)) return false;
   if (!q) return true;
   const hay = [rec.name, rec.role, rec.family, rec.quant, rec.dtype, rec.path, rec.fullPath]
@@ -1137,6 +1179,35 @@ function humanBytes(n) {
     v /= 1024;
   }
   return v.toFixed(2) + " TB";
+}
+
+function renderRootTabs() {
+  const tabs = document.getElementById("rootTabs");
+  const roots = [...new Set(DATA.map(r => r.root).filter(Boolean))].sort((a, b) =>
+    a.toLowerCase().localeCompare(b.toLowerCase())
+  );
+  const entries = [{ key: "__ALL__", label: "Все папки", count: DATA.length }, ...roots.map(root => ({
+    key: root,
+    label: root,
+    count: DATA.filter(r => r.root === root).length
+  }))];
+
+  tabs.innerHTML = entries.map(entry => {
+    const active = state.root === entry.key ? " active" : "";
+    return "<button class='root-tab" + active + "' type='button' role='tab' " +
+      "aria-selected='" + (state.root === entry.key ? "true" : "false") + "' " +
+      "title='" + escapeHtml(entry.label) + "' data-root='" + escapeHtml(entry.key) + "'>" +
+      escapeHtml(entry.label) +
+      "<span class='tab-count'>(" + entry.count + ")</span></button>";
+  }).join("");
+
+  tabs.querySelectorAll(".root-tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      state.root = tab.dataset.root;
+      renderRootTabs();
+      render();
+    });
+  });
 }
 
 function render() {
@@ -1216,6 +1287,7 @@ document.querySelectorAll("#modelsTable thead th").forEach(th => {
   });
 });
 
+renderRootTabs();
 render();
 </script>
 </body>
