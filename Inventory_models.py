@@ -186,8 +186,9 @@ def quick_hash(path: Path, size: int, sample: int = 1_048_576) -> str:
 
 
 def mark_duplicates(infos: list[ModelInfo]) -> None:
-    """Groups files that share an exact size + quick_hash and records each
-    other's full paths in `duplicate_paths`. Mutates infos in place."""
+    """Groups files that share the same quick fingerprint and records each
+    other's full paths in `duplicate_paths`. These are likely duplicates,
+    not cryptographic proof of identical full contents. Mutates infos in place."""
     groups: dict[tuple[int, str], list[ModelInfo]] = defaultdict(list)
     for info in infos:
         if info.quick_hash:
