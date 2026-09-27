@@ -1,5 +1,5 @@
 """
-Model Zoo Inspector
+Inventory models
 
 Recursively inventories SafeTensors/GGUF/checkpoint files and writes a single
 self-contained HTML report (opens directly in any browser): a sortable,
