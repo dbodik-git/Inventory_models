@@ -100,7 +100,7 @@ QUANT_PATTERNS = [
 
 # Bumped whenever ModelInfo's field set changes; guards against loading a
 # cache written by an older/incompatible version of this script.
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 5
 
 # ggml tensor type enum -> display name (llama.cpp / gguf spec). Unknown
 # values fall back to "GGML_TYPE_<n>" rather than failing.
@@ -144,6 +144,9 @@ class ModelInfo:
     warnings: list[str]
     quick_hash: str = ""
     duplicate_paths: list[str] = field(default_factory=list)
+    lora_trigger_words: list[str] = field(default_factory=list)
+    lora_tags: list[str] = field(default_factory=list)
+    lora_details: dict[str, str] = field(default_factory=dict)
 
 
 def human_bytes(value: int | None) -> str:
@@ -375,6 +378,11 @@ def dtype_summary(header: dict[str, Any]) -> tuple[str, int, int, int]:
 
 
 def selected_metadata(header: dict[str, Any]) -> dict[str, str]:
+    """Generic, cross-file-type metadata for display: architecture/title
+    style keys. LoRA training internals (ss_*) are intentionally excluded
+    here — they're extracted separately by extract_lora_info() into
+    structured fields instead of being dumped as a raw, sometimes
+    truncated, key/value soup."""
     raw = header.get("__metadata__", {})
     if not isinstance(raw, dict):
         return {}
@@ -387,18 +395,104 @@ def selected_metadata(header: dict[str, Any]) -> dict[str, str]:
             or key.startswith("_quantization_metadata")
             or key.startswith("modelspec.")
             or key.startswith("general.")
-            or key.startswith("ss_")
         ):
             text = str(value)
             out[key] = text if len(text) <= 500 else text[:497] + "..."
     return out
 
 
-def detect_role(path: Path, keys: list[str]) -> tuple[str, str]:
+LORA_TRIGGER_KEYS = ("modelspec.trigger_phrase", "trigger_phrase", "activation_text")
+LORA_TAG_FREQUENCY_KEY = "ss_tag_frequency"
+LORA_DETAIL_KEYS: dict[str, tuple[str, ...]] = {
+    "Base model": ("ss_sd_model_name", "modelspec.base_model", "ss_base_model_version"),
+    "Network module": ("ss_network_module",),
+    "Network dim": ("ss_network_dim",),
+    "Network alpha": ("ss_network_alpha",),
+    "Training images": ("ss_num_train_images",),
+    "Epochs": ("ss_num_epochs",),
+    "Learning rate": ("ss_learning_rate", "ss_unet_lr", "ss_text_encoder_lr"),
+    "Resolution": ("ss_resolution",),
+    "Output name": ("ss_output_name",),
+}
+LORA_MAX_TAGS = 25
+
+
+def _first_present(raw: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = raw.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _split_lora_triggers(value: str) -> list[str]:
+    result = []
+    for piece in re.split(r"[,\n;]+", value):
+        piece = piece.strip()
+        if piece and piece not in result:
+            result.append(piece)
+    return result
+
+
+def extract_lora_info(
+    header: dict[str, Any],
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """Extract explicit trigger words separately from frequent training tags.
+
+    Trigger words come from the explicit trigger metadata fields. The
+    ss_tag_frequency field is training-caption statistics, so its most
+    frequent tags are exposed separately as suggestions rather than being
+    presented as guaranteed triggers.
+    """
+    raw = header.get("__metadata__", {})
+    if not isinstance(raw, dict):
+        return [], [], {}
+
+    trigger_words: list[str] = []
+    trigger = _first_present(raw, LORA_TRIGGER_KEYS)
+    if trigger:
+        trigger_words = _split_lora_triggers(trigger)
+
+    tags: list[str] = []
+    tag_freq_raw = raw.get(LORA_TAG_FREQUENCY_KEY)
+    if isinstance(tag_freq_raw, str):
+        try:
+            tag_freq = json.loads(tag_freq_raw)
+        except Exception:
+            tag_freq = None
+        if isinstance(tag_freq, dict):
+            totals: Counter[str] = Counter()
+            for bucket in tag_freq.values():
+                if isinstance(bucket, dict):
+                    for tag, count in bucket.items():
+                        try:
+                            clean_tag = str(tag).strip()
+                            if clean_tag:
+                                totals[clean_tag] += int(count)
+                        except Exception:
+                            continue
+            tags = [tag for tag, _count in totals.most_common(LORA_MAX_TAGS)]
+
+    details: dict[str, str] = {}
+    for label, keys in LORA_DETAIL_KEYS.items():
+        value = _first_present(raw, keys)
+        if value:
+            details[label] = value if len(value) <= 300 else value[:297] + "..."
+
+    return trigger_words, tags, details
+
+
+def detect_role(
+    path: Path,
+    keys: list[str],
+    has_lora_metadata: bool = False,
+) -> tuple[str, str]:
     parts = {part.lower() for part in path.parts}
 
     if parts & LORA_DIR_WORDS:
         return "LoRA / adapter", "path"
+    if has_lora_metadata:
+        return "LoRA / adapter", "metadata"
     if parts & TEXT_ENCODER_DIR_WORDS:
         return "Text Encoder", "path"
     if parts & VAE_DIR_WORDS:
@@ -460,6 +554,7 @@ def inspect_safetensors(path: Path):
     keys = [str(k) for k in header if k != "__metadata__"]
     dtypes, tensor_count, payload, params = dtype_summary(header)
     metadata = selected_metadata(header)
+    lora_trigger_words, lora_tags, lora_details = extract_lora_info(header)
     quant, qsource, qlayers, special = infer_quantization(path, header)
     return (
         keys,
@@ -468,6 +563,9 @@ def inspect_safetensors(path: Path):
         payload,
         params,
         metadata,
+        lora_trigger_words,
+        lora_tags,
+        lora_details,
         quant,
         qsource,
         qlayers,
@@ -599,6 +697,9 @@ def inspect(path: Path, root: Path) -> ModelInfo:
     dtype = "�"
     quant_layers = None
     special = []
+    lora_trigger_words: list[str] = []
+    lora_tags: list[str] = []
+    lora_details: dict[str, str] = {}
 
     if ext == ".safetensors":
         try:
@@ -609,6 +710,9 @@ def inspect(path: Path, root: Path) -> ModelInfo:
                 payload_bytes,
                 param_count,
                 metadata,
+                lora_trigger_words,
+                lora_tags,
+                lora_details,
                 quantization,
                 qsource,
                 quant_layers,
@@ -624,7 +728,7 @@ def inspect(path: Path, root: Path) -> ModelInfo:
         warnings.extend(gguf_warnings)
         if type_counts:
             dtype = ", ".join(
-                f"{t}?{c}" for t, c in type_counts.most_common()
+                f"{t}×{c}" for t, c in type_counts.most_common()
             )
             quantization, qsource = gguf_quant_label(type_counts)
         else:
@@ -642,10 +746,18 @@ def inspect(path: Path, root: Path) -> ModelInfo:
         quantization = "None detected"
         qsource = "none"
 
-    role, _role_source = detect_role(path, keys)
+    has_lora_metadata = bool(lora_trigger_words or lora_tags or lora_details)
+    role, _role_source = detect_role(path, keys, has_lora_metadata)
     family, confidence, family_detection = detect_family(
-        path, keys, metadata
+        path, keys, {**metadata, **lora_details}
     )
+
+    is_lora = role.startswith("LoRA")
+    if not is_lora:
+        # Keep LoRA-specific fields out of non-LoRA items entirely.
+        lora_trigger_words = []
+        lora_tags = []
+        lora_details = {}
 
     rel = path.relative_to(root) if path.is_relative_to(root) else path
 
@@ -677,6 +789,9 @@ def inspect(path: Path, root: Path) -> ModelInfo:
         metadata=metadata,
         warnings=warnings,
         quick_hash=quick_hash(path, size),
+        lora_trigger_words=lora_trigger_words,
+        lora_tags=lora_tags,
+        lora_details=lora_details,
     )
 
 
@@ -706,7 +821,7 @@ def inspect_or_placeholder(path: Path, root: Path) -> ModelInfo:
             family_detection="inspection error",
             quantization="Unreadable",
             quantization_source="error",
-            dtype_summary="�",
+            dtype_summary="—",
             tensor_count=None,
             file_size_bytes=size,
             payload_bytes=None,
@@ -790,16 +905,6 @@ def file_uri(full_path: str) -> str:
     return ""
 
 
-DIAG_METADATA_KEYS = (
-    "converted_by",
-    "modelspec.architecture",
-    "modelspec.title",
-    "general.architecture",
-    "general.name",
-    "gguf.version",
-)
-
-
 def build_html(
     infos: list[ModelInfo],
     roots: list[Path],
@@ -844,9 +949,6 @@ def build_html(
 
     records = []
     for item in infos:
-        metadata_shown = {
-            k: v for k, v in item.metadata.items() if k in DIAG_METADATA_KEYS
-        }
         item_root = "Unknown root"
         try:
             item_path = Path(item.full_path).resolve()
@@ -880,12 +982,20 @@ def build_html(
             "tensors": item.tensor_count,
             "params": item.param_count,
             "paramsH": human_params(item.param_count),
+            "payloadBytes": item.payload_bytes,
+            "payloadH": human_bytes(item.payload_bytes),
             "quantLayers": item.quant_layers,
             "specialFormats": item.special_formats,
             "path": item.path,
             "fullPath": item.full_path,
             "link": file_uri(item.full_path),
-            "metadata": metadata_shown,
+            "folderPath": str(Path(item.full_path).parent),
+            "folderLink": file_uri(str(Path(item.full_path).parent)),
+            "quickHash": item.quick_hash,
+            "metadata": item.metadata,
+            "loraTriggerWords": item.lora_trigger_words,
+            "loraTags": item.lora_tags,
+            "loraDetails": item.lora_details,
             "warnings": item.warnings,
             "duplicates": [
                 {"path": d, "link": file_uri(d)} for d in item.duplicate_paths
@@ -1004,6 +1114,91 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .root-tab .tab-count { opacity: .7; margin-left: 5px; font-size: 12px; }
   .empty-state { padding: 30px; text-align: center; color: var(--muted); }
+  .model-row { cursor: pointer; }
+  .model-row:hover { background: var(--row-hover); }
+  .details-direct-link { margin-left: 4px; color: var(--accent); text-decoration: none; font-weight: 600; }
+  .details-direct-link:hover { text-decoration: underline; }
+  .details-modal[hidden] { display: none; }
+  .details-modal {
+    position: fixed; inset: 0; z-index: 1000; display: flex;
+    align-items: center; justify-content: center; padding: 24px;
+  }
+  .details-backdrop {
+    position: absolute; inset: 0; background: rgba(0,0,0,.62);
+    backdrop-filter: blur(2px);
+  }
+  .details-dialog {
+    position: relative; width: min(900px, 96vw); max-height: min(88vh, 900px);
+    overflow: hidden; background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: 0 24px 80px rgba(0,0,0,.45); display: flex; flex-direction: column;
+  }
+  .details-header {
+    display: flex; align-items: center; gap: 12px; padding: 16px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .details-title {
+    flex: 1; min-width: 0; font-size: 18px; font-weight: 650;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .details-close {
+    width: 34px; height: 34px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); cursor: pointer; font-size: 20px; line-height: 1;
+  }
+  .details-close:hover { background: var(--row-hover); }
+  .details-body { overflow: auto; padding: 18px; }
+  .details-summary {
+    margin-bottom: 16px; padding: 12px 14px; border: 1px solid var(--border);
+    border-radius: 10px; background: var(--row-hover);
+  }
+  .details-section { margin-top: 18px; }
+  .details-section h3 {
+    margin: 0 0 9px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .05em; color: var(--muted);
+  }
+  .details-grid {
+    display: grid; grid-template-columns: minmax(150px, .34fr) minmax(0, 1fr);
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+  }
+  .details-grid > div {
+    padding: 8px 10px; border-bottom: 1px solid var(--border);
+  }
+  .details-grid > div:nth-child(odd) {
+    color: var(--muted); background: color-mix(in srgb, var(--row-hover) 55%, var(--panel));
+  }
+  .details-grid > div:nth-last-child(-n+2) { border-bottom: 0; }
+  .details-value { overflow-wrap: anywhere; }
+  .details-mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+  .details-list { margin: 0; padding-left: 18px; }
+  .details-list li { margin: 4px 0; overflow-wrap: anywhere; }
+  .details-actions {
+    display: flex; gap: 8px; flex-wrap: wrap; padding: 14px 18px;
+    border-top: 1px solid var(--border); background: var(--panel);
+  }
+  .details-action {
+    display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); text-decoration: none; cursor: pointer; font: inherit;
+  }
+  .details-action.primary { color: var(--accent); }
+  .details-action:hover { background: var(--row-hover); }
+  .details-muted { color: var(--muted); }
+  .details-warning { color: var(--accent2); }
+  .details-duplicate { margin: 4px 0; }
+  .details-role-badge {
+    flex-shrink: 0; padding: 3px 10px; border-radius: 100px; font-size: 11.5px;
+    font-weight: 600; letter-spacing: .02em; border: 1px solid var(--border);
+  }
+  .details-role-badge.lora { color: #c084fc; border-color: #c084fc55; }
+  .details-role-badge.model { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .chip-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; padding: 4px 10px;
+    border-radius: 100px; background: var(--row-hover); border: 1px solid var(--border);
+    font-size: 12.5px; overflow-wrap: anywhere;
+  }
+  .chip.trigger { color: #c084fc; border-color: #c084fc55; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -1077,6 +1272,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <ul>__ROOTS_LIST__</ul>
 </footer>
 
+<div id="detailsModal" class="details-modal" hidden>
+  <div class="details-backdrop" data-close-details></div>
+  <section class="details-dialog" role="dialog" aria-modal="true" aria-labelledby="detailsTitle">
+    <div class="details-header">
+      <div id="detailsTitle" class="details-title">Model details</div>
+      <span id="detailsRoleBadge" class="details-role-badge model"></span>
+      <button id="detailsClose" class="details-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div id="detailsBody" class="details-body"></div>
+    <div id="detailsActions" class="details-actions"></div>
+  </section>
+</div>
+
 <script>
 const DATA = __DATA_JSON__;
 
@@ -1144,15 +1352,20 @@ function renderDiagCell(rec) {
   return "<details class='diag'><summary>details</summary>" + body + "</details>";
 }
 
-function rowHtml(rec, q) {
-  const nameCell = rec.link
-    ? "<a class='model-link' href='" + rec.link + "' target='_blank' rel='noopener'>" + highlight(rec.name, q) + "</a>"
-    : "<span class='no-link'>" + highlight(rec.name, q) + "</span>";
+function rowHtml(rec, q, index) {
+  const nameCell = "<span class='model-link'>" + highlight(rec.name, q) + "</span>" +
+    (rec.link
+      ? " <a class='details-direct-link' href='" + rec.link + "' target='_blank' rel='noopener' title='Open file'>↗</a>"
+      : "");
   const dupBadge = (rec.duplicates && rec.duplicates.length)
     ? " <span class='badge MEDIUM' title='Likely duplicate(s): same quick fingerprint'>dup &times;" + rec.duplicates.length + "</span>"
     : "";
-  return "<tr>" +
-    "<td>" + nameCell + dupBadge + renderDiagCell(rec) + "</td>" +
+  const loraKeywordCount = (rec.loraTriggerWords?.length || 0) + (rec.loraTags?.length || 0);
+  const kwBadge = loraKeywordCount
+    ? " <span class='badge HIGH' title='" + loraKeywordCount + " trigger word(s)/training tag(s) found'>🔑 " + loraKeywordCount + "</span>"
+    : "";
+  return "<tr class='model-row' data-index='" + index + "' title='Click for details'>" +
+    "<td>" + nameCell + dupBadge + kwBadge + renderDiagCell(rec) + "</td>" +
     "<td>" + highlight(rec.role, q) + "</td>" +
     "<td>" + highlight(rec.family, q) + "</td>" +
     "<td>" + highlight(rec.quant, q) + "</td>" +
@@ -1162,6 +1375,194 @@ function rowHtml(rec, q) {
     "<td><span class='badge " + rec.confidence + "'>" + rec.confidence + "</span></td>" +
     "<td class='path-cell'>" + highlight(rec.path, q) + "</td>" +
     "</tr>";
+}
+
+function detailsText(value, fallback = "—") {
+  if (value == null || value === "") return fallback;
+  return escapeHtml(String(value));
+}
+
+function detailsLink(href, label) {
+  if (!href) return "<span class='details-muted'>Unavailable</span>";
+  return "<a class='model-link' href='" + href + "' target='_blank' rel='noopener'>" + escapeHtml(label) + "</a>";
+}
+
+function detailsRow(label, value, className = "") {
+  return "<div>" + escapeHtml(label) + "</div><div class='details-value " + className + "'>" + value + "</div>";
+}
+
+function renderChips(items, chipClass = "") {
+  if (!items || !items.length) return "";
+  return "<div class='chip-list'>" + items.map(
+    t => "<span class='chip " + chipClass + "'>" + escapeHtml(t) + "</span>"
+  ).join("") + "</div>";
+}
+
+function renderWarningsAndDuplicates(rec) {
+  let body = "";
+  if (rec.warnings && rec.warnings.length) {
+    body += "<div class='details-section'><h3>Warnings</h3><ul class='details-list'>";
+    for (const warning of rec.warnings) {
+      body += "<li class='details-warning'>" + escapeHtml(warning) + "</li>";
+    }
+    body += "</ul></div>";
+  }
+  if (rec.duplicates && rec.duplicates.length) {
+    body += "<div class='details-section'><h3>Likely duplicates</h3>";
+    for (const d of rec.duplicates) {
+      body += "<div class='details-duplicate'>" +
+        (d.link
+          ? "<a class='model-link' href='" + d.link + "' target='_blank' rel='noopener'>" + escapeHtml(d.path) + "</a>"
+          : escapeHtml(d.path)) +
+        "</div>";
+    }
+    body += "</div>";
+  }
+  return body;
+}
+
+// Popup for checkpoints / diffusion models / VAEs / text encoders / GGUF —
+// architecture and quantization take center stage, no LoRA training noise.
+function renderModelDetailsBody(rec) {
+  const summary = "This item is classified as <strong>" + escapeHtml(rec.role || "Unknown") +
+    "</strong> in the <strong>" + escapeHtml(rec.family || "Unknown") + "</strong> family. " +
+    "Quantization: <strong>" + escapeHtml(rec.quant || "None detected") + "</strong>. " +
+    "Family confidence: <strong>" + escapeHtml(rec.confidence || "UNKNOWN") + "</strong>.";
+
+  let body = "<div class='details-summary'>" + summary + "</div>";
+
+  body += "<div class='details-section'><h3>File</h3><div class='details-grid'>" +
+    detailsRow("Name", detailsText(rec.name)) +
+    detailsRow("Extension", detailsText(rec.ext)) +
+    detailsRow("Role", detailsText(rec.role)) +
+    detailsRow("Family", detailsText(rec.family)) +
+    detailsRow("Family confidence", detailsText(rec.confidence)) +
+    detailsRow("Family detection", detailsText(rec.detection)) +
+    detailsRow("Relative path", "<span class='details-mono'>" + detailsText(rec.path) + "</span>") +
+    detailsRow("Full path", "<span class='details-mono'>" + detailsText(rec.fullPath) + "</span>") +
+    "</div></div>";
+
+  body += "<div class='details-section'><h3>Storage & structure</h3><div class='details-grid'>" +
+    detailsRow("File size", detailsText(rec.sizeH) + " (" + detailsText(rec.size) + " bytes)") +
+    detailsRow("Tensor payload", detailsText(rec.payloadH) + " (" + detailsText(rec.payloadBytes) + " bytes)") +
+    detailsRow("Tensor count", detailsText(rec.tensors)) +
+    detailsRow("Tensor elements", detailsText(rec.paramsH) + " (" + detailsText(rec.params) + ")") +
+    detailsRow("Dtype", detailsText(rec.dtype)) +
+    detailsRow("Quick fingerprint", "<span class='details-mono'>" + detailsText(rec.quickHash) + "</span>") +
+    "</div></div>";
+
+  body += "<div class='details-section'><h3>Quantization</h3><div class='details-grid'>" +
+    detailsRow("Quantization", detailsText(rec.quant)) +
+    detailsRow("Detected from", detailsText(rec.quantSource)) +
+    detailsRow("Quantized layer records", detailsText(rec.quantLayers)) +
+    detailsRow("Special formats", detailsText(
+      rec.specialFormats && rec.specialFormats.length ? rec.specialFormats.join(", ") : null
+    )) +
+    "</div></div>";
+
+  const metadataEntries = Object.entries(rec.metadata || {});
+  if (metadataEntries.length) {
+    let metadataHtml = "";
+    for (const [key, value] of metadataEntries) {
+      metadataHtml += detailsRow(key, detailsText(value));
+    }
+    body += "<div class='details-section'><h3>Model metadata</h3><div class='details-grid'>" +
+      metadataHtml + "</div></div>";
+  }
+
+  body += renderWarningsAndDuplicates(rec);
+  return body;
+}
+
+// Popup for LoRA / LyCORIS adapters — leads with trigger words/keywords and
+// the training recipe (base model, network dim/alpha, epochs...), which is
+// what you actually need when deciding which LoRA to load. Checkpoint-only
+// fields (quantization, full architecture breakdown) are left out entirely
+// so the two popups never mix content.
+function renderLoraDetailsBody(rec) {
+  const details = rec.loraDetails || {};
+  const summary = "LoRA / adapter in the <strong>" + escapeHtml(rec.family || "Unknown") + "</strong> family" +
+    (details["Base model"] ? ", trained on <strong>" + escapeHtml(details["Base model"]) + "</strong>" : "") +
+    ". Family confidence: <strong>" + escapeHtml(rec.confidence || "UNKNOWN") + "</strong>.";
+
+  let body = "<div class='details-summary'>" + summary + "</div>";
+
+  body += "<div class='details-section'><h3>🔑 Trigger words</h3>" + (
+    rec.loraTriggerWords && rec.loraTriggerWords.length
+      ? renderChips(rec.loraTriggerWords, "trigger")
+      : "<div class='details-muted'>No explicit trigger phrase embedded in this file.</div>"
+  ) + "</div>";
+
+  body += "<div class='details-section'><h3>🏷 Frequent training tags</h3>" + (
+    rec.loraTags && rec.loraTags.length
+      ? renderChips(rec.loraTags, "tag")
+      : "<div class='details-muted'>No ss_tag_frequency metadata embedded in this file.</div>"
+  ) + "</div>";
+
+  const trainingRows = [];
+  for (const label of ["Base model", "Network module", "Network dim", "Network alpha",
+                        "Training images", "Epochs", "Learning rate", "Resolution", "Output name"]) {
+    if (details[label]) trainingRows.push(detailsRow(label, detailsText(details[label])));
+  }
+  if (trainingRows.length) {
+    body += "<div class='details-section'><h3>Training recipe</h3><div class='details-grid'>" +
+      trainingRows.join("") + "</div></div>";
+  }
+
+  body += "<div class='details-section'><h3>File</h3><div class='details-grid'>" +
+    detailsRow("Name", detailsText(rec.name)) +
+    detailsRow("Family", detailsText(rec.family)) +
+    detailsRow("Family detection", detailsText(rec.detection)) +
+    detailsRow("File size", detailsText(rec.sizeH)) +
+    detailsRow("Relative path", "<span class='details-mono'>" + detailsText(rec.path) + "</span>") +
+    detailsRow("Full path", "<span class='details-mono'>" + detailsText(rec.fullPath) + "</span>") +
+    "</div></div>";
+
+  const metadataEntries = Object.entries(rec.metadata || {});
+  if (metadataEntries.length) {
+    let metadataHtml = "";
+    for (const [key, value] of metadataEntries) {
+      metadataHtml += detailsRow(key, detailsText(value));
+    }
+    body += "<div class='details-section'><h3>Other metadata</h3><div class='details-grid'>" +
+      metadataHtml + "</div></div>";
+  }
+
+  body += renderWarningsAndDuplicates(rec);
+  return body;
+}
+
+function showDetails(index) {
+  const rec = DATA[index];
+  if (!rec) return;
+
+  const isLora = !!(rec.role && rec.role.startsWith("LoRA"));
+
+  document.getElementById("detailsTitle").textContent = rec.name || "Details";
+
+  const badge = document.getElementById("detailsRoleBadge");
+  badge.textContent = isLora ? "LoRA / adapter" : (rec.role || "Model");
+  badge.className = "details-role-badge " + (isLora ? "lora" : "model");
+
+  document.getElementById("detailsBody").innerHTML = isLora
+    ? renderLoraDetailsBody(rec)
+    : renderModelDetailsBody(rec);
+
+  let actions = "";
+  if (rec.link) {
+    actions += "<a class='details-action primary' href='" + rec.link + "' target='_blank' rel='noopener'>📄 Open file</a>";
+  }
+  if (rec.folderLink) {
+    actions += "<a class='details-action' href='" + rec.folderLink + "' target='_blank' rel='noopener'>📂 Open folder</a>";
+  }
+  document.getElementById("detailsActions").innerHTML = actions;
+  document.getElementById("detailsModal").hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
+function closeDetails() {
+  document.getElementById("detailsModal").hidden = true;
+  document.body.style.overflow = "";
 }
 
 function groupRowHtml(label, items) {
@@ -1239,10 +1640,10 @@ function render() {
     });
     for (const key of groupKeys) {
       html += groupRowHtml(key, groups.get(key));
-      for (const r of groups.get(key)) html += rowHtml(r, q);
+      for (const r of groups.get(key)) html += rowHtml(r, q, DATA.indexOf(r));
     }
   } else {
-    for (const r of rows) html += rowHtml(r, q);
+    for (const r of rows) html += rowHtml(r, q, DATA.indexOf(r));
   }
   tbody.innerHTML = html;
 }
@@ -1266,6 +1667,22 @@ document.getElementById("groupBy").addEventListener("change", e => {
 document.getElementById("dupOnly").addEventListener("change", e => {
   state.dupOnly = e.target.checked;
   render();
+});
+
+document.getElementById("tbody").addEventListener("click", e => {
+  if (e.target.closest("a, button, input, select, details, summary")) return;
+  const row = e.target.closest("tr.model-row");
+  if (!row) return;
+  const index = Number(row.dataset.index);
+  if (Number.isInteger(index)) showDetails(index);
+});
+
+document.getElementById("detailsClose").addEventListener("click", closeDetails);
+document.querySelector("[data-close-details]").addEventListener("click", closeDetails);
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !document.getElementById("detailsModal").hidden) {
+    closeDetails();
+  }
 });
 
 document.querySelectorAll("#modelsTable thead th").forEach(th => {
