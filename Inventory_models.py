@@ -100,7 +100,7 @@ QUANT_PATTERNS = [
 
 # Bumped whenever ModelInfo's field set changes; guards against loading a
 # cache written by an older/incompatible version of this script.
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 
 # ggml tensor type enum -> display name (llama.cpp / gguf spec). Unknown
 # values fall back to "GGML_TYPE_<n>" rather than failing.
@@ -144,7 +144,8 @@ class ModelInfo:
     warnings: list[str]
     quick_hash: str = ""
     duplicate_paths: list[str] = field(default_factory=list)
-    lora_keywords: list[str] = field(default_factory=list)
+    lora_trigger_words: list[str] = field(default_factory=list)
+    lora_tags: list[str] = field(default_factory=list)
     lora_details: dict[str, str] = field(default_factory=dict)
 
 
@@ -413,7 +414,7 @@ LORA_DETAIL_KEYS: dict[str, tuple[str, ...]] = {
     "Resolution": ("ss_resolution",),
     "Output name": ("ss_output_name",),
 }
-LORA_MAX_KEYWORDS = 25
+LORA_MAX_TAGS = 25
 
 
 def _first_present(raw: dict[str, Any], keys: tuple[str, ...]) -> str | None:
@@ -424,27 +425,35 @@ def _first_present(raw: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     return None
 
 
-def extract_lora_info(header: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
-    """Pulls LoRA/LyCORIS training metadata (kohya-ss sd-scripts style)
-    into a structured, display-ready shape: a deduplicated keyword/trigger
-    word list (from an explicit trigger phrase plus the most frequent
-    caption tags seen during training) and a small table of training
-    facts (base model, network dim/alpha, epochs, etc). Works on the raw
-    __metadata__ block, not the truncated copy selected_metadata() makes,
-    since ss_tag_frequency alone can be tens of KB of JSON."""
+def _split_lora_triggers(value: str) -> list[str]:
+    result = []
+    for piece in re.split(r"[,\n;]+", value):
+        piece = piece.strip()
+        if piece and piece not in result:
+            result.append(piece)
+    return result
+
+
+def extract_lora_info(
+    header: dict[str, Any],
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """Extract explicit trigger words separately from frequent training tags.
+
+    Trigger words come from the explicit trigger metadata fields. The
+    ss_tag_frequency field is training-caption statistics, so its most
+    frequent tags are exposed separately as suggestions rather than being
+    presented as guaranteed triggers.
+    """
     raw = header.get("__metadata__", {})
     if not isinstance(raw, dict):
-        return [], {}
+        return [], [], {}
 
-    keywords: list[str] = []
-
+    trigger_words: list[str] = []
     trigger = _first_present(raw, LORA_TRIGGER_KEYS)
     if trigger:
-        for piece in re.split(r"[,\n;]+", trigger):
-            piece = piece.strip()
-            if piece and piece not in keywords:
-                keywords.append(piece)
+        trigger_words = _split_lora_triggers(trigger)
 
+    tags: list[str] = []
     tag_freq_raw = raw.get(LORA_TAG_FREQUENCY_KEY)
     if isinstance(tag_freq_raw, str):
         try:
@@ -452,17 +461,17 @@ def extract_lora_info(header: dict[str, Any]) -> tuple[list[str], dict[str, str]
         except Exception:
             tag_freq = None
         if isinstance(tag_freq, dict):
-            totals: Counter = Counter()
+            totals: Counter[str] = Counter()
             for bucket in tag_freq.values():
                 if isinstance(bucket, dict):
                     for tag, count in bucket.items():
                         try:
-                            totals[str(tag).strip()] += int(count)
+                            clean_tag = str(tag).strip()
+                            if clean_tag:
+                                totals[clean_tag] += int(count)
                         except Exception:
                             continue
-            for tag, _count in totals.most_common(LORA_MAX_KEYWORDS):
-                if tag and tag not in keywords:
-                    keywords.append(tag)
+            tags = [tag for tag, _count in totals.most_common(LORA_MAX_TAGS)]
 
     details: dict[str, str] = {}
     for label, keys in LORA_DETAIL_KEYS.items():
@@ -470,14 +479,20 @@ def extract_lora_info(header: dict[str, Any]) -> tuple[list[str], dict[str, str]
         if value:
             details[label] = value if len(value) <= 300 else value[:297] + "..."
 
-    return keywords, details
+    return trigger_words, tags, details
 
 
-def detect_role(path: Path, keys: list[str]) -> tuple[str, str]:
+def detect_role(
+    path: Path,
+    keys: list[str],
+    has_lora_metadata: bool = False,
+) -> tuple[str, str]:
     parts = {part.lower() for part in path.parts}
 
     if parts & LORA_DIR_WORDS:
         return "LoRA / adapter", "path"
+    if has_lora_metadata:
+        return "LoRA / adapter", "metadata"
     if parts & TEXT_ENCODER_DIR_WORDS:
         return "Text Encoder", "path"
     if parts & VAE_DIR_WORDS:
@@ -539,7 +554,7 @@ def inspect_safetensors(path: Path):
     keys = [str(k) for k in header if k != "__metadata__"]
     dtypes, tensor_count, payload, params = dtype_summary(header)
     metadata = selected_metadata(header)
-    lora_keywords, lora_details = extract_lora_info(header)
+    lora_trigger_words, lora_tags, lora_details = extract_lora_info(header)
     quant, qsource, qlayers, special = infer_quantization(path, header)
     return (
         keys,
@@ -548,7 +563,8 @@ def inspect_safetensors(path: Path):
         payload,
         params,
         metadata,
-        lora_keywords,
+        lora_trigger_words,
+        lora_tags,
         lora_details,
         quant,
         qsource,
@@ -681,7 +697,8 @@ def inspect(path: Path, root: Path) -> ModelInfo:
     dtype = "�"
     quant_layers = None
     special = []
-    lora_keywords: list[str] = []
+    lora_trigger_words: list[str] = []
+    lora_tags: list[str] = []
     lora_details: dict[str, str] = {}
 
     if ext == ".safetensors":
@@ -693,7 +710,8 @@ def inspect(path: Path, root: Path) -> ModelInfo:
                 payload_bytes,
                 param_count,
                 metadata,
-                lora_keywords,
+                lora_trigger_words,
+                lora_tags,
                 lora_details,
                 quantization,
                 qsource,
@@ -710,7 +728,7 @@ def inspect(path: Path, root: Path) -> ModelInfo:
         warnings.extend(gguf_warnings)
         if type_counts:
             dtype = ", ".join(
-                f"{t}?{c}" for t, c in type_counts.most_common()
+                f"{t}×{c}" for t, c in type_counts.most_common()
             )
             quantization, qsource = gguf_quant_label(type_counts)
         else:
@@ -728,16 +746,17 @@ def inspect(path: Path, root: Path) -> ModelInfo:
         quantization = "None detected"
         qsource = "none"
 
-    role, _role_source = detect_role(path, keys)
+    has_lora_metadata = bool(lora_trigger_words or lora_tags or lora_details)
+    role, _role_source = detect_role(path, keys, has_lora_metadata)
     family, confidence, family_detection = detect_family(
         path, keys, {**metadata, **lora_details}
     )
 
     is_lora = role.startswith("LoRA")
     if not is_lora:
-        # Keep training-recipe fields out of non-LoRA items entirely, so
-        # the two detail popups never mix content.
-        lora_keywords = []
+        # Keep LoRA-specific fields out of non-LoRA items entirely.
+        lora_trigger_words = []
+        lora_tags = []
         lora_details = {}
 
     rel = path.relative_to(root) if path.is_relative_to(root) else path
@@ -770,7 +789,8 @@ def inspect(path: Path, root: Path) -> ModelInfo:
         metadata=metadata,
         warnings=warnings,
         quick_hash=quick_hash(path, size),
-        lora_keywords=lora_keywords,
+        lora_trigger_words=lora_trigger_words,
+        lora_tags=lora_tags,
         lora_details=lora_details,
     )
 
@@ -801,7 +821,7 @@ def inspect_or_placeholder(path: Path, root: Path) -> ModelInfo:
             family_detection="inspection error",
             quantization="Unreadable",
             quantization_source="error",
-            dtype_summary="�",
+            dtype_summary="—",
             tensor_count=None,
             file_size_bytes=size,
             payload_bytes=None,
@@ -973,7 +993,8 @@ def build_html(
             "folderLink": file_uri(str(Path(item.full_path).parent)),
             "quickHash": item.quick_hash,
             "metadata": item.metadata,
-            "loraKeywords": item.lora_keywords,
+            "loraTriggerWords": item.lora_trigger_words,
+            "loraTags": item.lora_tags,
             "loraDetails": item.lora_details,
             "warnings": item.warnings,
             "duplicates": [
@@ -1466,10 +1487,16 @@ function renderLoraDetailsBody(rec) {
 
   let body = "<div class='details-summary'>" + summary + "</div>";
 
-  body += "<div class='details-section'><h3>Trigger words / keywords</h3>" + (
-    rec.loraKeywords && rec.loraKeywords.length
-      ? renderChips(rec.loraKeywords, "trigger")
-      : "<div class='details-muted'>No trigger phrase or caption-tag metadata embedded in this file.</div>"
+  body += "<div class='details-section'><h3>🔑 Trigger words</h3>" + (
+    rec.loraTriggerWords && rec.loraTriggerWords.length
+      ? renderChips(rec.loraTriggerWords, "trigger")
+      : "<div class='details-muted'>No explicit trigger phrase embedded in this file.</div>"
+  ) + "</div>";
+
+  body += "<div class='details-section'><h3>🏷 Frequent training tags</h3>" + (
+    rec.loraTags && rec.loraTags.length
+      ? renderChips(rec.loraTags, "tag")
+      : "<div class='details-muted'>No ss_tag_frequency metadata embedded in this file.</div>"
   ) + "</div>";
 
   const trainingRows = [];
