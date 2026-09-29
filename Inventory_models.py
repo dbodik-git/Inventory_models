@@ -1339,8 +1339,9 @@ function rowHtml(rec, q, index) {
   const dupBadge = (rec.duplicates && rec.duplicates.length)
     ? " <span class='badge MEDIUM' title='Likely duplicate(s): same quick fingerprint'>dup &times;" + rec.duplicates.length + "</span>"
     : "";
-  const kwBadge = (rec.loraKeywords && rec.loraKeywords.length)
-    ? " <span class='badge HIGH' title='" + rec.loraKeywords.length + " trigger word(s)/tag(s) found'>🔑 " + rec.loraKeywords.length + "</span>"
+  const loraKeywordCount = (rec.loraTriggerWords?.length || 0) + (rec.loraTags?.length || 0);
+  const kwBadge = loraKeywordCount
+    ? " <span class='badge HIGH' title='" + loraKeywordCount + " trigger word(s)/training tag(s) found'>🔑 " + loraKeywordCount + "</span>"
     : "";
   return "<tr class='model-row' data-index='" + index + "' title='Click for details'>" +
     "<td>" + nameCell + dupBadge + kwBadge + renderDiagCell(rec) + "</td>" +
