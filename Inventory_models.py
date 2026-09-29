@@ -100,7 +100,7 @@ QUANT_PATTERNS = [
 
 # Bumped whenever ModelInfo's field set changes; guards against loading a
 # cache written by an older/incompatible version of this script.
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 
 # ggml tensor type enum -> display name (llama.cpp / gguf spec). Unknown
 # values fall back to "GGML_TYPE_<n>" rather than failing.
@@ -144,6 +144,8 @@ class ModelInfo:
     warnings: list[str]
     quick_hash: str = ""
     duplicate_paths: list[str] = field(default_factory=list)
+    lora_keywords: list[str] = field(default_factory=list)
+    lora_details: dict[str, str] = field(default_factory=dict)
 
 
 def human_bytes(value: int | None) -> str:
@@ -375,6 +377,11 @@ def dtype_summary(header: dict[str, Any]) -> tuple[str, int, int, int]:
 
 
 def selected_metadata(header: dict[str, Any]) -> dict[str, str]:
+    """Generic, cross-file-type metadata for display: architecture/title
+    style keys. LoRA training internals (ss_*) are intentionally excluded
+    here — they're extracted separately by extract_lora_info() into
+    structured fields instead of being dumped as a raw, sometimes
+    truncated, key/value soup."""
     raw = header.get("__metadata__", {})
     if not isinstance(raw, dict):
         return {}
@@ -387,11 +394,83 @@ def selected_metadata(header: dict[str, Any]) -> dict[str, str]:
             or key.startswith("_quantization_metadata")
             or key.startswith("modelspec.")
             or key.startswith("general.")
-            or key.startswith("ss_")
         ):
             text = str(value)
             out[key] = text if len(text) <= 500 else text[:497] + "..."
     return out
+
+
+LORA_TRIGGER_KEYS = ("modelspec.trigger_phrase", "trigger_phrase", "activation_text")
+LORA_TAG_FREQUENCY_KEY = "ss_tag_frequency"
+LORA_DETAIL_KEYS: dict[str, tuple[str, ...]] = {
+    "Base model": ("ss_sd_model_name", "modelspec.base_model", "ss_base_model_version"),
+    "Network module": ("ss_network_module",),
+    "Network dim": ("ss_network_dim",),
+    "Network alpha": ("ss_network_alpha",),
+    "Training images": ("ss_num_train_images",),
+    "Epochs": ("ss_num_epochs",),
+    "Learning rate": ("ss_learning_rate", "ss_unet_lr", "ss_text_encoder_lr"),
+    "Resolution": ("ss_resolution",),
+    "Output name": ("ss_output_name",),
+}
+LORA_MAX_KEYWORDS = 25
+
+
+def _first_present(raw: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = raw.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def extract_lora_info(header: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+    """Pulls LoRA/LyCORIS training metadata (kohya-ss sd-scripts style)
+    into a structured, display-ready shape: a deduplicated keyword/trigger
+    word list (from an explicit trigger phrase plus the most frequent
+    caption tags seen during training) and a small table of training
+    facts (base model, network dim/alpha, epochs, etc). Works on the raw
+    __metadata__ block, not the truncated copy selected_metadata() makes,
+    since ss_tag_frequency alone can be tens of KB of JSON."""
+    raw = header.get("__metadata__", {})
+    if not isinstance(raw, dict):
+        return [], {}
+
+    keywords: list[str] = []
+
+    trigger = _first_present(raw, LORA_TRIGGER_KEYS)
+    if trigger:
+        for piece in re.split(r"[,\n;]+", trigger):
+            piece = piece.strip()
+            if piece and piece not in keywords:
+                keywords.append(piece)
+
+    tag_freq_raw = raw.get(LORA_TAG_FREQUENCY_KEY)
+    if isinstance(tag_freq_raw, str):
+        try:
+            tag_freq = json.loads(tag_freq_raw)
+        except Exception:
+            tag_freq = None
+        if isinstance(tag_freq, dict):
+            totals: Counter = Counter()
+            for bucket in tag_freq.values():
+                if isinstance(bucket, dict):
+                    for tag, count in bucket.items():
+                        try:
+                            totals[str(tag).strip()] += int(count)
+                        except Exception:
+                            continue
+            for tag, _count in totals.most_common(LORA_MAX_KEYWORDS):
+                if tag and tag not in keywords:
+                    keywords.append(tag)
+
+    details: dict[str, str] = {}
+    for label, keys in LORA_DETAIL_KEYS.items():
+        value = _first_present(raw, keys)
+        if value:
+            details[label] = value if len(value) <= 300 else value[:297] + "..."
+
+    return keywords, details
 
 
 def detect_role(path: Path, keys: list[str]) -> tuple[str, str]:
@@ -460,6 +539,7 @@ def inspect_safetensors(path: Path):
     keys = [str(k) for k in header if k != "__metadata__"]
     dtypes, tensor_count, payload, params = dtype_summary(header)
     metadata = selected_metadata(header)
+    lora_keywords, lora_details = extract_lora_info(header)
     quant, qsource, qlayers, special = infer_quantization(path, header)
     return (
         keys,
@@ -468,6 +548,8 @@ def inspect_safetensors(path: Path):
         payload,
         params,
         metadata,
+        lora_keywords,
+        lora_details,
         quant,
         qsource,
         qlayers,
@@ -599,6 +681,8 @@ def inspect(path: Path, root: Path) -> ModelInfo:
     dtype = "�"
     quant_layers = None
     special = []
+    lora_keywords: list[str] = []
+    lora_details: dict[str, str] = {}
 
     if ext == ".safetensors":
         try:
@@ -609,6 +693,8 @@ def inspect(path: Path, root: Path) -> ModelInfo:
                 payload_bytes,
                 param_count,
                 metadata,
+                lora_keywords,
+                lora_details,
                 quantization,
                 qsource,
                 quant_layers,
@@ -644,8 +730,15 @@ def inspect(path: Path, root: Path) -> ModelInfo:
 
     role, _role_source = detect_role(path, keys)
     family, confidence, family_detection = detect_family(
-        path, keys, metadata
+        path, keys, {**metadata, **lora_details}
     )
+
+    is_lora = role.startswith("LoRA")
+    if not is_lora:
+        # Keep training-recipe fields out of non-LoRA items entirely, so
+        # the two detail popups never mix content.
+        lora_keywords = []
+        lora_details = {}
 
     rel = path.relative_to(root) if path.is_relative_to(root) else path
 
@@ -677,6 +770,8 @@ def inspect(path: Path, root: Path) -> ModelInfo:
         metadata=metadata,
         warnings=warnings,
         quick_hash=quick_hash(path, size),
+        lora_keywords=lora_keywords,
+        lora_details=lora_details,
     )
 
 
@@ -790,16 +885,6 @@ def file_uri(full_path: str) -> str:
     return ""
 
 
-DIAG_METADATA_KEYS = (
-    "converted_by",
-    "modelspec.architecture",
-    "modelspec.title",
-    "general.architecture",
-    "general.name",
-    "gguf.version",
-)
-
-
 def build_html(
     infos: list[ModelInfo],
     roots: list[Path],
@@ -844,9 +929,6 @@ def build_html(
 
     records = []
     for item in infos:
-        metadata_shown = {
-            k: v for k, v in item.metadata.items() if k in DIAG_METADATA_KEYS
-        }
         item_root = "Unknown root"
         try:
             item_path = Path(item.full_path).resolve()
@@ -891,6 +973,8 @@ def build_html(
             "folderLink": file_uri(str(Path(item.full_path).parent)),
             "quickHash": item.quick_hash,
             "metadata": item.metadata,
+            "loraKeywords": item.lora_keywords,
+            "loraDetails": item.lora_details,
             "warnings": item.warnings,
             "duplicates": [
                 {"path": d, "link": file_uri(d)} for d in item.duplicate_paths
@@ -1081,6 +1165,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .details-muted { color: var(--muted); }
   .details-warning { color: var(--accent2); }
   .details-duplicate { margin: 4px 0; }
+  .details-role-badge {
+    flex-shrink: 0; padding: 3px 10px; border-radius: 100px; font-size: 11.5px;
+    font-weight: 600; letter-spacing: .02em; border: 1px solid var(--border);
+  }
+  .details-role-badge.lora { color: #c084fc; border-color: #c084fc55; }
+  .details-role-badge.model { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .chip-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; padding: 4px 10px;
+    border-radius: 100px; background: var(--row-hover); border: 1px solid var(--border);
+    font-size: 12.5px; overflow-wrap: anywhere;
+  }
+  .chip.trigger { color: #c084fc; border-color: #c084fc55; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -1159,6 +1256,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <section class="details-dialog" role="dialog" aria-modal="true" aria-labelledby="detailsTitle">
     <div class="details-header">
       <div id="detailsTitle" class="details-title">Model details</div>
+      <span id="detailsRoleBadge" class="details-role-badge model"></span>
       <button id="detailsClose" class="details-close" type="button" aria-label="Close">×</button>
     </div>
     <div id="detailsBody" class="details-body"></div>
@@ -1241,8 +1339,11 @@ function rowHtml(rec, q, index) {
   const dupBadge = (rec.duplicates && rec.duplicates.length)
     ? " <span class='badge MEDIUM' title='Likely duplicate(s): same quick fingerprint'>dup &times;" + rec.duplicates.length + "</span>"
     : "";
+  const kwBadge = (rec.loraKeywords && rec.loraKeywords.length)
+    ? " <span class='badge HIGH' title='" + rec.loraKeywords.length + " trigger word(s)/tag(s) found'>🔑 " + rec.loraKeywords.length + "</span>"
+    : "";
   return "<tr class='model-row' data-index='" + index + "' title='Click for details'>" +
-    "<td>" + nameCell + dupBadge + renderDiagCell(rec) + "</td>" +
+    "<td>" + nameCell + dupBadge + kwBadge + renderDiagCell(rec) + "</td>" +
     "<td>" + highlight(rec.role, q) + "</td>" +
     "<td>" + highlight(rec.family, q) + "</td>" +
     "<td>" + highlight(rec.quant, q) + "</td>" +
@@ -1268,12 +1369,39 @@ function detailsRow(label, value, className = "") {
   return "<div>" + escapeHtml(label) + "</div><div class='details-value " + className + "'>" + value + "</div>";
 }
 
-function showDetails(index) {
-  const rec = DATA[index];
-  if (!rec) return;
+function renderChips(items, chipClass = "") {
+  if (!items || !items.length) return "";
+  return "<div class='chip-list'>" + items.map(
+    t => "<span class='chip " + chipClass + "'>" + escapeHtml(t) + "</span>"
+  ).join("") + "</div>";
+}
 
-  document.getElementById("detailsTitle").textContent = rec.name || "Model details";
+function renderWarningsAndDuplicates(rec) {
+  let body = "";
+  if (rec.warnings && rec.warnings.length) {
+    body += "<div class='details-section'><h3>Warnings</h3><ul class='details-list'>";
+    for (const warning of rec.warnings) {
+      body += "<li class='details-warning'>" + escapeHtml(warning) + "</li>";
+    }
+    body += "</ul></div>";
+  }
+  if (rec.duplicates && rec.duplicates.length) {
+    body += "<div class='details-section'><h3>Likely duplicates</h3>";
+    for (const d of rec.duplicates) {
+      body += "<div class='details-duplicate'>" +
+        (d.link
+          ? "<a class='model-link' href='" + d.link + "' target='_blank' rel='noopener'>" + escapeHtml(d.path) + "</a>"
+          : escapeHtml(d.path)) +
+        "</div>";
+    }
+    body += "</div>";
+  }
+  return body;
+}
 
+// Popup for checkpoints / diffusion models / VAEs / text encoders / GGUF —
+// architecture and quantization take center stage, no LoRA training noise.
+function renderModelDetailsBody(rec) {
   const summary = "This item is classified as <strong>" + escapeHtml(rec.role || "Unknown") +
     "</strong> in the <strong>" + escapeHtml(rec.family || "Unknown") + "</strong> family. " +
     "Quantization: <strong>" + escapeHtml(rec.quant || "None detected") + "</strong>. " +
@@ -1316,31 +1444,81 @@ function showDetails(index) {
     for (const [key, value] of metadataEntries) {
       metadataHtml += detailsRow(key, detailsText(value));
     }
-    body += "<div class='details-section'><h3>Metadata</h3><div class='details-grid'>" +
+    body += "<div class='details-section'><h3>Model metadata</h3><div class='details-grid'>" +
       metadataHtml + "</div></div>";
   }
 
-  if (rec.warnings && rec.warnings.length) {
-    body += "<div class='details-section'><h3>Warnings</h3><ul class='details-list'>";
-    for (const warning of rec.warnings) {
-      body += "<li class='details-warning'>" + escapeHtml(warning) + "</li>";
-    }
-    body += "</ul></div>";
+  body += renderWarningsAndDuplicates(rec);
+  return body;
+}
+
+// Popup for LoRA / LyCORIS adapters — leads with trigger words/keywords and
+// the training recipe (base model, network dim/alpha, epochs...), which is
+// what you actually need when deciding which LoRA to load. Checkpoint-only
+// fields (quantization, full architecture breakdown) are left out entirely
+// so the two popups never mix content.
+function renderLoraDetailsBody(rec) {
+  const details = rec.loraDetails || {};
+  const summary = "LoRA / adapter in the <strong>" + escapeHtml(rec.family || "Unknown") + "</strong> family" +
+    (details["Base model"] ? ", trained on <strong>" + escapeHtml(details["Base model"]) + "</strong>" : "") +
+    ". Family confidence: <strong>" + escapeHtml(rec.confidence || "UNKNOWN") + "</strong>.";
+
+  let body = "<div class='details-summary'>" + summary + "</div>";
+
+  body += "<div class='details-section'><h3>Trigger words / keywords</h3>" + (
+    rec.loraKeywords && rec.loraKeywords.length
+      ? renderChips(rec.loraKeywords, "trigger")
+      : "<div class='details-muted'>No trigger phrase or caption-tag metadata embedded in this file.</div>"
+  ) + "</div>";
+
+  const trainingRows = [];
+  for (const label of ["Base model", "Network module", "Network dim", "Network alpha",
+                        "Training images", "Epochs", "Learning rate", "Resolution", "Output name"]) {
+    if (details[label]) trainingRows.push(detailsRow(label, detailsText(details[label])));
+  }
+  if (trainingRows.length) {
+    body += "<div class='details-section'><h3>Training recipe</h3><div class='details-grid'>" +
+      trainingRows.join("") + "</div></div>";
   }
 
-  if (rec.duplicates && rec.duplicates.length) {
-    body += "<div class='details-section'><h3>Likely duplicates</h3>";
-    for (const d of rec.duplicates) {
-      body += "<div class='details-duplicate'>" +
-        (d.link
-          ? "<a class='model-link' href='" + d.link + "' target='_blank' rel='noopener'>" + escapeHtml(d.path) + "</a>"
-          : escapeHtml(d.path)) +
-        "</div>";
+  body += "<div class='details-section'><h3>File</h3><div class='details-grid'>" +
+    detailsRow("Name", detailsText(rec.name)) +
+    detailsRow("Family", detailsText(rec.family)) +
+    detailsRow("Family detection", detailsText(rec.detection)) +
+    detailsRow("File size", detailsText(rec.sizeH)) +
+    detailsRow("Relative path", "<span class='details-mono'>" + detailsText(rec.path) + "</span>") +
+    detailsRow("Full path", "<span class='details-mono'>" + detailsText(rec.fullPath) + "</span>") +
+    "</div></div>";
+
+  const metadataEntries = Object.entries(rec.metadata || {});
+  if (metadataEntries.length) {
+    let metadataHtml = "";
+    for (const [key, value] of metadataEntries) {
+      metadataHtml += detailsRow(key, detailsText(value));
     }
-    body += "</div>";
+    body += "<div class='details-section'><h3>Other metadata</h3><div class='details-grid'>" +
+      metadataHtml + "</div></div>";
   }
 
-  document.getElementById("detailsBody").innerHTML = body;
+  body += renderWarningsAndDuplicates(rec);
+  return body;
+}
+
+function showDetails(index) {
+  const rec = DATA[index];
+  if (!rec) return;
+
+  const isLora = !!(rec.role && rec.role.startsWith("LoRA"));
+
+  document.getElementById("detailsTitle").textContent = rec.name || "Details";
+
+  const badge = document.getElementById("detailsRoleBadge");
+  badge.textContent = isLora ? "LoRA / adapter" : (rec.role || "Model");
+  badge.className = "details-role-badge " + (isLora ? "lora" : "model");
+
+  document.getElementById("detailsBody").innerHTML = isLora
+    ? renderLoraDetailsBody(rec)
+    : renderModelDetailsBody(rec);
 
   let actions = "";
   if (rec.link) {
