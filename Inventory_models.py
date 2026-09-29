@@ -1011,6 +1011,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .empty-state { padding: 30px; text-align: center; color: var(--muted); }
   .model-row { cursor: pointer; }
   .model-row:hover { background: var(--row-hover); }
+  .details-direct-link { margin-left: 4px; color: var(--accent); text-decoration: none; font-weight: 600; }
+  .details-direct-link:hover { text-decoration: underline; }
   .details-modal[hidden] { display: none; }
   .details-modal {
     position: fixed; inset: 0; z-index: 1000; display: flex;
@@ -1462,7 +1464,7 @@ document.getElementById("dupOnly").addEventListener("change", e => {
 });
 
 document.getElementById("tbody").addEventListener("click", e => {
-  if (e.target.closest("a, button, input, select")) return;
+  if (e.target.closest("a, button, input, select, details, summary")) return;
   const row = e.target.closest("tr.model-row");
   if (!row) return;
   const index = Number(row.dataset.index);
