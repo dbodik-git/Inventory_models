@@ -880,12 +880,17 @@ def build_html(
             "tensors": item.tensor_count,
             "params": item.param_count,
             "paramsH": human_params(item.param_count),
+            "payloadBytes": item.payload_bytes,
+            "payloadH": human_bytes(item.payload_bytes),
             "quantLayers": item.quant_layers,
             "specialFormats": item.special_formats,
             "path": item.path,
             "fullPath": item.full_path,
             "link": file_uri(item.full_path),
-            "metadata": metadata_shown,
+            "folderPath": str(Path(item.full_path).parent),
+            "folderLink": file_uri(str(Path(item.full_path).parent)),
+            "quickHash": item.quick_hash,
+            "metadata": item.metadata,
             "warnings": item.warnings,
             "duplicates": [
                 {"path": d, "link": file_uri(d)} for d in item.duplicate_paths
@@ -1004,6 +1009,76 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .root-tab .tab-count { opacity: .7; margin-left: 5px; font-size: 12px; }
   .empty-state { padding: 30px; text-align: center; color: var(--muted); }
+  .model-row { cursor: pointer; }
+  .model-row:hover { background: var(--row-hover); }
+  .details-modal[hidden] { display: none; }
+  .details-modal {
+    position: fixed; inset: 0; z-index: 1000; display: flex;
+    align-items: center; justify-content: center; padding: 24px;
+  }
+  .details-backdrop {
+    position: absolute; inset: 0; background: rgba(0,0,0,.62);
+    backdrop-filter: blur(2px);
+  }
+  .details-dialog {
+    position: relative; width: min(900px, 96vw); max-height: min(88vh, 900px);
+    overflow: hidden; background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: 0 24px 80px rgba(0,0,0,.45); display: flex; flex-direction: column;
+  }
+  .details-header {
+    display: flex; align-items: center; gap: 12px; padding: 16px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .details-title {
+    flex: 1; min-width: 0; font-size: 18px; font-weight: 650;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .details-close {
+    width: 34px; height: 34px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); cursor: pointer; font-size: 20px; line-height: 1;
+  }
+  .details-close:hover { background: var(--row-hover); }
+  .details-body { overflow: auto; padding: 18px; }
+  .details-summary {
+    margin-bottom: 16px; padding: 12px 14px; border: 1px solid var(--border);
+    border-radius: 10px; background: var(--row-hover);
+  }
+  .details-section { margin-top: 18px; }
+  .details-section h3 {
+    margin: 0 0 9px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .05em; color: var(--muted);
+  }
+  .details-grid {
+    display: grid; grid-template-columns: minmax(150px, .34fr) minmax(0, 1fr);
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+  }
+  .details-grid > div {
+    padding: 8px 10px; border-bottom: 1px solid var(--border);
+  }
+  .details-grid > div:nth-child(odd) {
+    color: var(--muted); background: color-mix(in srgb, var(--row-hover) 55%, var(--panel));
+  }
+  .details-grid > div:nth-last-child(-n+2) { border-bottom: 0; }
+  .details-value { overflow-wrap: anywhere; }
+  .details-mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+  .details-list { margin: 0; padding-left: 18px; }
+  .details-list li { margin: 4px 0; overflow-wrap: anywhere; }
+  .details-actions {
+    display: flex; gap: 8px; flex-wrap: wrap; padding: 14px 18px;
+    border-top: 1px solid var(--border); background: var(--panel);
+  }
+  .details-action {
+    display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); text-decoration: none; cursor: pointer; font: inherit;
+  }
+  .details-action.primary { color: var(--accent); }
+  .details-action:hover { background: var(--row-hover); }
+  .details-muted { color: var(--muted); }
+  .details-warning { color: var(--accent2); }
+  .details-duplicate { margin: 4px 0; }
 </style>
 </head>
 <body>
@@ -1077,6 +1152,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <ul>__ROOTS_LIST__</ul>
 </footer>
 
+<div id="detailsModal" class="details-modal" hidden>
+  <div class="details-backdrop" data-close-details></div>
+  <section class="details-dialog" role="dialog" aria-modal="true" aria-labelledby="detailsTitle">
+    <div class="details-header">
+      <div id="detailsTitle" class="details-title">Model details</div>
+      <button id="detailsClose" class="details-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div id="detailsBody" class="details-body"></div>
+    <div id="detailsActions" class="details-actions"></div>
+  </section>
+</div>
+
 <script>
 const DATA = __DATA_JSON__;
 
@@ -1144,14 +1231,15 @@ function renderDiagCell(rec) {
   return "<details class='diag'><summary>details</summary>" + body + "</details>";
 }
 
-function rowHtml(rec, q) {
-  const nameCell = rec.link
-    ? "<a class='model-link' href='" + rec.link + "' target='_blank' rel='noopener'>" + highlight(rec.name, q) + "</a>"
-    : "<span class='no-link'>" + highlight(rec.name, q) + "</span>";
+function rowHtml(rec, q, index) {
+  const nameCell = "<span class='model-link'>" + highlight(rec.name, q) + "</span>" +
+    (rec.link
+      ? " <a class='details-direct-link' href='" + rec.link + "' target='_blank' rel='noopener' title='Open file'>↗</a>"
+      : "");
   const dupBadge = (rec.duplicates && rec.duplicates.length)
     ? " <span class='badge MEDIUM' title='Likely duplicate(s): same quick fingerprint'>dup &times;" + rec.duplicates.length + "</span>"
     : "";
-  return "<tr>" +
+  return "<tr class='model-row' data-index='" + index + "' title='Click for details'>" +
     "<td>" + nameCell + dupBadge + renderDiagCell(rec) + "</td>" +
     "<td>" + highlight(rec.role, q) + "</td>" +
     "<td>" + highlight(rec.family, q) + "</td>" +
@@ -1162,6 +1250,111 @@ function rowHtml(rec, q) {
     "<td><span class='badge " + rec.confidence + "'>" + rec.confidence + "</span></td>" +
     "<td class='path-cell'>" + highlight(rec.path, q) + "</td>" +
     "</tr>";
+}
+
+function detailsText(value, fallback = "—") {
+  if (value == null || value === "") return fallback;
+  return escapeHtml(String(value));
+}
+
+function detailsLink(href, label) {
+  if (!href) return "<span class='details-muted'>Unavailable</span>";
+  return "<a class='model-link' href='" + href + "' target='_blank' rel='noopener'>" + escapeHtml(label) + "</a>";
+}
+
+function detailsRow(label, value, className = "") {
+  return "<div>" + escapeHtml(label) + "</div><div class='details-value " + className + "'>" + value + "</div>";
+}
+
+function showDetails(index) {
+  const rec = DATA[index];
+  if (!rec) return;
+
+  document.getElementById("detailsTitle").textContent = rec.name || "Model details";
+
+  const summary = "This item is classified as <strong>" + escapeHtml(rec.role || "Unknown") +
+    "</strong> in the <strong>" + escapeHtml(rec.family || "Unknown") + "</strong> family. " +
+    "Quantization: <strong>" + escapeHtml(rec.quant || "None detected") + "</strong>. " +
+    "Family confidence: <strong>" + escapeHtml(rec.confidence || "UNKNOWN") + "</strong>.";
+
+  let body = "<div class='details-summary'>" + summary + "</div>";
+
+  body += "<div class='details-section'><h3>File</h3><div class='details-grid'>" +
+    detailsRow("Name", detailsText(rec.name)) +
+    detailsRow("Extension", detailsText(rec.ext)) +
+    detailsRow("Role", detailsText(rec.role)) +
+    detailsRow("Family", detailsText(rec.family)) +
+    detailsRow("Family confidence", detailsText(rec.confidence)) +
+    detailsRow("Family detection", detailsText(rec.detection)) +
+    detailsRow("Relative path", "<span class='details-mono'>" + detailsText(rec.path) + "</span>") +
+    detailsRow("Full path", "<span class='details-mono'>" + detailsText(rec.fullPath) + "</span>") +
+    "</div></div>";
+
+  body += "<div class='details-section'><h3>Storage & structure</h3><div class='details-grid'>" +
+    detailsRow("File size", detailsText(rec.sizeH) + " (" + detailsText(rec.size) + " bytes)") +
+    detailsRow("Tensor payload", detailsText(rec.payloadH) + " (" + detailsText(rec.payloadBytes) + " bytes)") +
+    detailsRow("Tensor count", detailsText(rec.tensors)) +
+    detailsRow("Tensor elements", detailsText(rec.paramsH) + " (" + detailsText(rec.params) + ")") +
+    detailsRow("Dtype", detailsText(rec.dtype)) +
+    detailsRow("Quick fingerprint", "<span class='details-mono'>" + detailsText(rec.quickHash) + "</span>") +
+    "</div></div>";
+
+  body += "<div class='details-section'><h3>Quantization</h3><div class='details-grid'>" +
+    detailsRow("Quantization", detailsText(rec.quant)) +
+    detailsRow("Detected from", detailsText(rec.quantSource)) +
+    detailsRow("Quantized layer records", detailsText(rec.quantLayers)) +
+    detailsRow("Special formats", detailsText(
+      rec.specialFormats && rec.specialFormats.length ? rec.specialFormats.join(", ") : null
+    )) +
+    "</div></div>";
+
+  const metadataEntries = Object.entries(rec.metadata || {});
+  if (metadataEntries.length) {
+    let metadataHtml = "";
+    for (const [key, value] of metadataEntries) {
+      metadataHtml += detailsRow(key, detailsText(value));
+    }
+    body += "<div class='details-section'><h3>Metadata</h3><div class='details-grid'>" +
+      metadataHtml + "</div></div>";
+  }
+
+  if (rec.warnings && rec.warnings.length) {
+    body += "<div class='details-section'><h3>Warnings</h3><ul class='details-list'>";
+    for (const warning of rec.warnings) {
+      body += "<li class='details-warning'>" + escapeHtml(warning) + "</li>";
+    }
+    body += "</ul></div>";
+  }
+
+  if (rec.duplicates && rec.duplicates.length) {
+    body += "<div class='details-section'><h3>Likely duplicates</h3>";
+    for (const d of rec.duplicates) {
+      body += "<div class='details-duplicate'>" +
+        (d.link
+          ? "<a class='model-link' href='" + d.link + "' target='_blank' rel='noopener'>" + escapeHtml(d.path) + "</a>"
+          : escapeHtml(d.path)) +
+        "</div>";
+    }
+    body += "</div>";
+  }
+
+  document.getElementById("detailsBody").innerHTML = body;
+
+  let actions = "";
+  if (rec.link) {
+    actions += "<a class='details-action primary' href='" + rec.link + "' target='_blank' rel='noopener'>📄 Open file</a>";
+  }
+  if (rec.folderLink) {
+    actions += "<a class='details-action' href='" + rec.folderLink + "' target='_blank' rel='noopener'>📂 Open folder</a>";
+  }
+  document.getElementById("detailsActions").innerHTML = actions;
+  document.getElementById("detailsModal").hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
+function closeDetails() {
+  document.getElementById("detailsModal").hidden = true;
+  document.body.style.overflow = "";
 }
 
 function groupRowHtml(label, items) {
@@ -1239,10 +1432,10 @@ function render() {
     });
     for (const key of groupKeys) {
       html += groupRowHtml(key, groups.get(key));
-      for (const r of groups.get(key)) html += rowHtml(r, q);
+      for (const r of groups.get(key)) html += rowHtml(r, q, DATA.indexOf(r));
     }
   } else {
-    for (const r of rows) html += rowHtml(r, q);
+    for (const r of rows) html += rowHtml(r, q, DATA.indexOf(r));
   }
   tbody.innerHTML = html;
 }
@@ -1266,6 +1459,22 @@ document.getElementById("groupBy").addEventListener("change", e => {
 document.getElementById("dupOnly").addEventListener("change", e => {
   state.dupOnly = e.target.checked;
   render();
+});
+
+document.getElementById("tbody").addEventListener("click", e => {
+  if (e.target.closest("a, button, input, select")) return;
+  const row = e.target.closest("tr.model-row");
+  if (!row) return;
+  const index = Number(row.dataset.index);
+  if (Number.isInteger(index)) showDetails(index);
+});
+
+document.getElementById("detailsClose").addEventListener("click", closeDetails);
+document.querySelector("[data-close-details]").addEventListener("click", closeDetails);
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !document.getElementById("detailsModal").hidden) {
+    closeDetails();
+  }
 });
 
 document.querySelectorAll("#modelsTable thead th").forEach(th => {
