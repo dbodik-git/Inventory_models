@@ -924,14 +924,20 @@ def build_html(
         ),
     )
     family_rows = "\n".join(
-        f"<tr><td>{esc_html(family)}</td><td class='num'>{len(items)}</td>"
+        f"<tr class='summary-filter-row' role='button' tabindex='0' data-filter-kind='family' "
+        f"data-filter-value='{esc_html(family)}' title='Filter table by {esc_html(family)}'>"
+        f"<td><input class='summary-filter-check' type='checkbox' tabindex='-1' aria-label='Filter {esc_html(family)}'></td>"
+        f"<td><span>{esc_html(family)}</span></td><td class='num'>{len(items)}</td>"
         f"<td class='num'>{human_bytes(sum(i.file_size_bytes for i in items))}</td></tr>"
         for family, items in family_items
     )
 
     qcount = Counter(i.quantization for i in infos)
     quant_rows = "\n".join(
-        f"<tr><td>{esc_html(q)}</td><td class='num'>{count}</td></tr>"
+        f"<tr class='summary-filter-row' role='button' tabindex='0' data-filter-kind='quant' "
+        f"data-filter-value='{esc_html(q)}' title='Filter table by {esc_html(q)}'>"
+        f"<td><input class='summary-filter-check' type='checkbox' tabindex='-1' aria-label='Filter {esc_html(q)}'></td>"
+        f"<td><span>{esc_html(q)}</span></td><td class='num'>{count}</td></tr>"
         for q, count in sorted(qcount.items(), key=lambda x: (-x[1], x[0].lower()))
     )
 
@@ -1049,6 +1055,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .summary-grid { display: flex; flex-wrap: wrap; gap: 16px; }
   .summary-grid .panel { flex: 1 1 260px; }
+  .summary-hint {
+    font-size: 10px; font-weight: 500; text-transform: none; letter-spacing: 0;
+    opacity: .65; margin-left: 5px;
+  }
+  .summary-filter-row {
+    cursor: pointer; transition: background .12s ease;
+  }
+  .summary-filter-row:hover { background: var(--row-hover); }
+  .summary-filter-row.active {
+    background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  }
+  .summary-filter-row.active td { color: var(--text); }
+  .summary-filter-row td:first-child {
+    width: 28px; padding-right: 2px; padding-left: 6px;
+  }
+  .summary-filter-check {
+    width: 15px; height: 15px; margin: 0; accent-color: var(--accent);
+    pointer-events: none;
+  }
+  .summary-duplicates-panel { cursor: pointer; transition: background .12s ease; }
+  .summary-duplicates-panel:hover { background: var(--row-hover); }
+  .summary-duplicates-panel.active {
+    background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  }
+  .summary-dup-control { display: flex; align-items: center; gap: 9px; }
   h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
   table { width: 100%; border-collapse: collapse; }
   th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); }
@@ -1213,16 +1244,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="meta" style="margin-bottom:0">files, __TOTAL_SIZE__ total</div>
   </div>
   <div class="panel">
-    <h2>By family</h2>
+    <h2>By family <span class="summary-hint">click to filter</span></h2>
     <table><tbody>__FAMILY_ROWS__</tbody></table>
   </div>
   <div class="panel">
-    <h2>By quantization</h2>
+    <h2>By quantization <span class="summary-hint">click to filter</span></h2>
     <table><tbody>__QUANT_ROWS__</tbody></table>
   </div>
-  <div class="panel">
-    <h2>Duplicates</h2>
-    <div class="stat">__DUP_COUNT__</div>
+  <div class="panel summary-duplicates-panel" id="dupSummaryFilter" role="button" tabindex="0"
+       title="Show only files with likely duplicates">
+    <h2>Duplicates <span class="summary-hint">click to filter</span></h2>
+    <div class="summary-dup-control">
+      <input id="dupSummaryCheck" class="summary-filter-check" type="checkbox" tabindex="-1"
+             aria-label="Show duplicates only">
+      <div class="stat">__DUP_COUNT__</div>
+    </div>
     <div class="meta" style="margin-bottom:0">group(s) &middot; __DUP_WASTED__ reclaimable</div>
   </div>
 </div>
@@ -1290,7 +1326,8 @@ const DATA = __DATA_JSON__;
 
 const state = {
   search: "", sortKey: "size", sortDir: -1, groupBy: "family",
-  dupOnly: false, root: "__ALL__"
+  dupOnly: false, root: "__ALL__",
+  familyFilters: new Set(), quantFilters: new Set()
 };
 
 function escapeHtml(s) {
@@ -1314,6 +1351,8 @@ function matchesRoot(rec) {
 
 function matches(rec, q) {
   if (!matchesRoot(rec)) return false;
+  if (state.familyFilters.size && !state.familyFilters.has(rec.family)) return false;
+  if (state.quantFilters.size && !state.quantFilters.has(rec.quant)) return false;
   if (state.dupOnly && !(rec.duplicates && rec.duplicates.length)) return false;
   if (!q) return true;
   const hay = [rec.name, rec.role, rec.family, rec.quant, rec.dtype, rec.path, rec.fullPath]
@@ -1582,6 +1621,59 @@ function humanBytes(n) {
   return v.toFixed(2) + " TB";
 }
 
+function renderSummaryFilters() {
+  document.querySelectorAll(".summary-filter-row").forEach(row => {
+    const kind = row.dataset.filterKind;
+    const value = row.dataset.filterValue;
+    const active = kind === "family"
+      ? state.familyFilters.has(value)
+      : state.quantFilters.has(value);
+    row.classList.toggle("active", active);
+    const check = row.querySelector(".summary-filter-check");
+    if (check) check.checked = active;
+  });
+
+  const dupPanel = document.getElementById("dupSummaryFilter");
+  const dupCheck = document.getElementById("dupSummaryCheck");
+  if (dupPanel) dupPanel.classList.toggle("active", state.dupOnly);
+  if (dupCheck) dupCheck.checked = state.dupOnly;
+}
+
+function toggleSummaryFilter(kind, value) {
+  const target = kind === "family" ? state.familyFilters : state.quantFilters;
+  if (target.has(value)) target.delete(value);
+  else target.add(value);
+  renderSummaryFilters();
+  render();
+}
+
+document.querySelectorAll(".summary-filter-row").forEach(row => {
+  const activate = () => toggleSummaryFilter(row.dataset.filterKind, row.dataset.filterValue);
+  row.addEventListener("click", activate);
+  row.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      activate();
+    }
+  });
+});
+
+const dupSummaryFilter = document.getElementById("dupSummaryFilter");
+if (dupSummaryFilter) {
+  const toggleDupSummary = () => {
+    state.dupOnly = !state.dupOnly;
+    renderSummaryFilters();
+    render();
+  };
+  dupSummaryFilter.addEventListener("click", toggleDupSummary);
+  dupSummaryFilter.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggleDupSummary();
+    }
+  });
+}
+
 function renderRootTabs() {
   const tabs = document.getElementById("rootTabs");
   const roots = [...new Set(DATA.map(r => r.root).filter(Boolean))].sort((a, b) =>
@@ -1655,7 +1747,12 @@ document.getElementById("search").addEventListener("input", e => {
 
 document.getElementById("clearBtn").addEventListener("click", () => {
   state.search = "";
+  state.familyFilters.clear();
+  state.quantFilters.clear();
+  state.dupOnly = false;
   document.getElementById("search").value = "";
+  document.getElementById("dupOnly").checked = false;
+  renderSummaryFilters();
   render();
 });
 
@@ -1666,6 +1763,7 @@ document.getElementById("groupBy").addEventListener("change", e => {
 
 document.getElementById("dupOnly").addEventListener("change", e => {
   state.dupOnly = e.target.checked;
+  renderSummaryFilters();
   render();
 });
 
@@ -1704,6 +1802,7 @@ document.querySelectorAll("#modelsTable thead th").forEach(th => {
   });
 });
 
+renderSummaryFilters();
 renderRootTabs();
 render();
 </script>
