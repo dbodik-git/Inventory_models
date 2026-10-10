@@ -16,3 +16,5 @@ Examples:
 ```
   python model_inventory.py "C:\\Models" --output models.html --json models.json
 ```
+
+<img width="1588" height="1241" alt="Screen-2026-10-06_17-06-16" src="https://github.com/user-attachments/assets/e2f352cd-1810-4636-9a7d-a4cdf1ba24a6" />
