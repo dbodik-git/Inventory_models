@@ -47,6 +47,24 @@ FAMILY_PATTERNS = [
         (re.compile(r"llm_adapter", re.I), 4),
         (re.compile(r"cosmos", re.I), 3),
     ]),
+    # Qwen-Image 2.1: 7B single-stream DiT (32 blocks, shared modulation).
+    # Listed before plain Qwen-Image so it wins ties; Comfy-format keys use
+    # a fused `img_mlp.gate_up` instead of v1's `img_mlp.net.0.proj`, and
+    # kohya-style LoRAs flatten the dots to underscores, hence [._].
+    ("Qwen-Image 2.1", [
+        (re.compile(r"qwen[-_ ]?image[-_ ]?2[._-]?1", re.I), 6),
+        (re.compile(r"img_mlp[._]gate_up", re.I), 5),
+    ]),
+    # MOSS-Image (OpenMOSS): 5B single-stream DiT, FLUX.2 VAE + Qwen3.5-9B
+    # text encoder. ComfyUI itself identifies it by these two tensor names.
+    # Filename rule is deliberately `moss-image`, not bare `moss`, so MOSS
+    # TTS/VL checkpoints aren't mislabelled as an image model.
+    ("MOSS-Image", [
+        (re.compile(r"moss[-_ ]?image", re.I), 6),
+        (re.compile(r"shared_block_modulation", re.I), 5),
+        (re.compile(r"proj[._]ffn_up_gate", re.I), 5),
+        (re.compile(r"rope\.bands", re.I), 2),
+    ]),
     ("Qwen-Image", [
         (re.compile(r"qwen[-_ ]image", re.I), 4),
         (re.compile(r"time_text_embed", re.I), 4),
