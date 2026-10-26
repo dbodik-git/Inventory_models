@@ -529,6 +529,24 @@ def detect_role(
         return "Text Encoder", "tensor keys"
     if "diffusion_model" in key_text or "transformer_blocks" in key_text:
         return "Diffusion Model", "tensor keys"
+
+    # MOSS-Image checkpoints may use flattened/direct transformer keys rather
+    # than the usual `model.diffusion_model` or `transformer_blocks` prefixes.
+    # Require multiple architecture-specific tensor signatures so a filename
+    # containing only the word "moss" cannot force a role classification.
+    moss_role_signatures = (
+        re.compile(r"shared_block_modulation", re.I),
+        re.compile(r"proj[._]ffn_up_gate", re.I),
+        re.compile(r"rope\.bands", re.I),
+        re.compile(r"final_linear_video", re.I),
+        re.compile(r"layers\.\d+\.proj[._](?:qkv|ffn_down|ffn_up_gate|o)(?:[._]|$)", re.I),
+    )
+    moss_signature_count = sum(
+        bool(pattern.search(key_text)) for pattern in moss_role_signatures
+    )
+    if moss_signature_count >= 2:
+        return "Diffusion Model", "MOSS-Image tensor keys"
+
     if path.suffix.lower() == ".gguf":
         return "GGUF model", "extension"
     if path.suffix.lower() in {".ckpt", ".pt", ".pth"}:
